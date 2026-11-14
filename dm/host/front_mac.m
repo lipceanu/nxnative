@@ -31,6 +31,7 @@ static void merge_rumble_to_s2(int on);
 #include "home_quit.h"
 #include "home_quit_mac.h"
 #include "ctrl_prompt.h"
+#include "screen_match.h"
 #include <signal.h>
 #include <math.h>
 #include <sys/stat.h>
@@ -64,19 +65,18 @@ static _Atomic int g_fullscreen;   // the window is in fullscreen (set when it h
 // the game, which keeps its focus, and ShowKeyboard's applet sends its own out-of-focus / in-focus pair (DM_APPLET). Monster Hunter Rise dropped the hunter's name after the round trip and asked again. Main thread only
 static int g_text_box;
 int front_fullscreen(void) { return g_fullscreen; }   // nvn_mtl.m link_latency: frame latency 2 in variable-refresh fullscreen
-// The screen's refresh rate matched to the game's frame rate in fullscreen (front_screen_match, from PR #79; DM_SCREEN_MATCH=0 turns it off). 60 fps on a 144 Hz screen cannot be paced
+// The screen's refresh rate matched to the game's frame rate in fullscreen (front_screen_match, from PR #79; DM_SCREEN_MATCH=0 turns it off, screen_match.h). 60 fps on a 144 Hz screen cannot be paced
 // evenly: the display link counts a tick on the refresh nearest each 1/60 s slot (nvn_mtl.m link_range), so frames stay up 2 and 3 refreshes in turn (13.9 / 20.8 ms) and Apple's HUD shows
 // the frame interval jumping between them. In fullscreen, a screen whose rate is not a multiple of the game's switches to the mode of the same size with the highest rate that is (144 → 120 Hz
 // for 60 and 30 fps), for this app only: macOS switches it back when the host quits, crashes included, and leaving fullscreen or that screen switches it back at once. A window keeps the
 // screen's rate, because the switch changes the whole screen for every app and most external screens go black for a second or more. A screen with no such mode keeps the virtual ticks.
-// A variable-refresh screen (ProMotion) in fullscreen switches to a fixed-rate mode of the same size at a multiple of the game's rate (120 → 60 Hz for 60 and 30 fps), though its own
-// rate is a multiple: there the display link at 60 Hz missed its targets (every present a 120 Hz refresh late and every other tick skipped, 40 fps on an M5 Pro at frame latency 2;
-// 1 → 2 → 3 vsync steps at latency 1, issue #347), and the fixed 60 Hz mode held 60.0 fps at latency 1 (docs/reference/frame-rate.md). A screen with no such mode keeps its rate, and
-// the 120 Hz link paces it (nvn_mtl.m link_vrr_120)
+// A variable-refresh screen (ProMotion) whose rate is a multiple of the game's keeps its own mode, and the 120 Hz link paces it (nvn_mtl.m link_vrr_120): the 60 Hz link missed its
+// targets there (every present a 120 Hz refresh late and every other tick skipped, 40 fps on an M5 Pro, PR #1967), which the 120 Hz link does not. DM_SCREEN_MATCH=vrr switches such a
+// screen to a fixed-rate mode of the same size at a multiple of the game's rate instead (120 → 60 Hz for 60 and 30 fps), as PR #1967 did by default: 60.0 fps at latency 1 on the
+// M5 Pro, but on an M1 Pro the fixed 60 Hz mode about halved the GPU's throughput, Tears of the Kingdom 60 → 30 fps (docs/reference/frame-rate.md)
 static NSWindow *g_win; static _Atomic int g_match_want;   // the game's window; the frame rate to match (0 = not known yet), written by the present thread only
 static CGDirectDisplayID g_match_id; static CGDisplayModeRef g_match_orig; static int g_match_orig_vrr;   // main thread: the screen this host switched, its own mode (NULL = none switched) and whether that mode is variable-refresh
 static double mode_hz(CGDisplayModeRef m) { double hz = CGDisplayModeGetRefreshRate(m); return hz > 0 ? hz : 0; }   // 0 = not known (older built-in screens report none)
-static int hz_multiple(double hz, int fps) { double k = round(hz / fps); return k >= 1 && fabs(hz / fps - k) < 0.01; }   // 59.94 Hz counts as 60
 static CGError screen_set_mode(CGDirectDisplayID id, CGDisplayModeRef m) {   // for this app only (kCGConfigureForAppOnly)
     CGDisplayConfigRef cfg; CGError r = CGBeginDisplayConfiguration(&cfg);
     if (r != kCGErrorSuccess) return r;
@@ -91,18 +91,23 @@ static void screen_match_restore(int on_it) {   // main thread: the screen this 
     CGDisplayModeRelease(g_match_orig); g_match_orig = NULL;
 }
 static void screen_match_apply(void) {   // main thread: on a new frame rate, on entering and leaving fullscreen and on a move to another screen
-    static int off = -1; if (off < 0) { const char *e = getenv("DM_SCREEN_MATCH"); off = e && !strcmp(e, "0"); if (off) LOG("front end: the screen keeps its refresh rate in fullscreen too (DM_SCREEN_MATCH=0)"); }
+    static int mode = -1;
+    if (mode < 0) {
+        mode = screen_match_mode(getenv("DM_SCREEN_MATCH"));
+        if (mode == SCREEN_MATCH_OFF) LOG("front end: the screen keeps its refresh rate in fullscreen too (DM_SCREEN_MATCH=0)");
+        if (mode == SCREEN_MATCH_VRR) LOG("front end: a variable-refresh screen goes to a fixed-rate mode in fullscreen (DM_SCREEN_MATCH=vrr)");
+    }
     NSScreen *scr = g_win.screen; int want = g_match_want, full = (g_win.styleMask & NSWindowStyleMaskFullScreen) != 0;
     CGDirectDisplayID id = scr ? [scr.deviceDescription[@"NSScreenNumber"] unsignedIntValue] : kCGNullDirectDisplay;
     if (g_match_orig && (!full || id != g_match_id)) screen_match_restore(id == g_match_id);
-    if (off || !full || want <= 0 || !scr) return;
+    if (mode == SCREEN_MATCH_OFF || !full || want <= 0 || !scr) return;
     CGDisplayModeRef cur = CGDisplayCopyDisplayMode(id);
     if (!cur) return;
     double hz = mode_hz(cur);
     // the current mode is variable-refresh: the screen's own mode as screen_refresh saw it; one this host switched to as it chose it (the screen observer may lag), so a
     // fixed mode is never left for the variable one at a rate it already matches
     int vrr = !g_match_orig ? g_screen_variable_refresh : CGDisplayModeGetIODisplayModeID(cur) == CGDisplayModeGetIODisplayModeID(g_match_orig) ? g_match_orig_vrr : 0;
-    if (!vrr && (hz <= 0 || hz_multiple(hz, want))) {   // already a multiple, or not known
+    if (!screen_match_wanted(mode, vrr, hz, want)) {   // already a multiple (a variable-refresh screen without DM_SCREEN_MATCH=vrr), or not known
         if (g_match_orig && hz > 0) g_screen_fps = (int)round(hz);   // the screen this host switched: its rate from the mode, which maximumFramesPerSecond (the screen observer) may not show yet
         CGDisplayModeRelease(cur); return;
     }
@@ -114,9 +119,9 @@ static void screen_match_apply(void) {   // main thread: on a new frame rate, on
         if (CGDisplayModeGetWidth(m) != w || CGDisplayModeGetHeight(m) != h || CGDisplayModeGetPixelWidth(m) != pw || CGDisplayModeGetPixelHeight(m) != ph || !CGDisplayModeIsUsableForDesktopGUI(m)) continue;
         // on a variable-refresh screen only a fixed-rate mode: not the current one, nor one at its rate (the variable mode at the screen's top rate)
         if (vrr && (CGDisplayModeGetIODisplayModeID(m) == CGDisplayModeGetIODisplayModeID(cur) || (hz > 0 && fabs(r - hz) < 0.5))) continue;
-        if (hz_multiple(r, want) && r > pick_hz) { pick = m; pick_hz = r; }
+        if (screen_hz_multiple(r, want) && r > pick_hz) { pick = m; pick_hz = r; }
     }
-    if (!pick && vrr && (hz <= 0 || hz_multiple(hz, want))) LOG("front end: variable-refresh screen at %.0f Hz has no fixed-rate mode of this size at a multiple of %d Hz: it keeps its rate", hz, want);
+    if (!pick && vrr && (hz <= 0 || screen_hz_multiple(hz, want))) LOG("front end: variable-refresh screen at %.0f Hz has no fixed-rate mode of this size at a multiple of %d Hz: it keeps its rate", hz, want);
     else if (!pick) LOG("front end: screen at %.0f Hz has no mode of this size at a multiple of %d Hz: frames are paced on the nearest refreshes", hz, want);
     else {
         CGError r = screen_set_mode(id, pick);

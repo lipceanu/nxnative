@@ -27,6 +27,7 @@
 #include "../nvn/nvn_mtl.m"
 #undef nvn_game_fps
 #undef CAMetalDisplayLink
+#include "../../host/screen_match.h"   // front_mac.m's choice of whether fullscreen switches the screen's mode
 static uint64_t test_now;
 int test_focus = 1;
 int test_fullscreen;
@@ -159,7 +160,7 @@ static void vrr120(void) {   // 60 fps in fullscreen on a variable-refresh scree
     CHECK("fullscreen on a 120 Hz variable-refresh screen takes the 120 Hz link", g_link_mode == 2 && link.preferredFrameRateRange.preferred == 120 && mtl_link_rate() == 120);
     CHECK("the 120 Hz link leaves the requested mode as it was", g_dm_present_link == 1);
     CHECK("the 120 Hz link keeps frame latency 2", link.preferredFrameLatency == 2);
-    CHECK("the screen is asked for the game's 60, so it can go to a fixed 60 Hz mode", test_match_fps == 60);
+    CHECK("the screen is asked for the game's 60 (a fixed 60 Hz mode with DM_SCREEN_MATCH=vrr)", test_match_fps == 60);
     test_variable_refresh = 0; link_sync(); CHECK("fullscreen on a fixed-rate screen keeps the 60 Hz link", g_link_mode == 1 && link.preferredFrameRateRange.preferred == 60);
     test_variable_refresh = 1; test_screen_hz = 144; link_sync(); CHECK("a variable-refresh screen at 144 Hz keeps the 60 Hz link", g_link_mode == 1);
     test_screen_hz = 0; link_sync(); CHECK("a screen of unknown rate keeps the 60 Hz link", g_link_mode == 1);
@@ -171,6 +172,22 @@ static void vrr120(void) {   // 60 fps in fullscreen on a variable-refresh scree
     test_fullscreen = 0; link_sync(); CHECK("leaving fullscreen: the 60 Hz link again", g_link_mode == 1 && link.preferredFrameRateRange.preferred == 60 && mtl_link_rate() == 60);
     g_dm_present_link = 2; link_sync(); CHECK("DM_PRESENT_LINK=2 keeps the 120 Hz link in a window", g_link_mode == 2 && test_match_fps == 120);
     g_dm_present_link = 1; test_screen_hz = 0; test_variable_refresh = 0; link_sync(); g_link = nil; g_link_started = 0;
+}
+static void screen_match(void) {   // DM_SCREEN_MATCH and the screen: whether fullscreen looks for another mode (front_mac.m screen_match_apply)
+    int d = screen_match_mode(NULL), v = screen_match_mode("vrr"), o = screen_match_mode("0");
+    CHECK("DM_SCREEN_MATCH unset, 1 and vrr parse", d == SCREEN_MATCH_FIXED && screen_match_mode("1") == SCREEN_MATCH_FIXED && v == SCREEN_MATCH_VRR && o == SCREEN_MATCH_OFF);
+    CHECK("by default a 120 Hz variable-refresh screen keeps its mode at 60 fps (the 120 Hz link paces it)", !screen_match_wanted(d, 1, 120, 60));
+    CHECK("by default a 120 Hz variable-refresh screen keeps its mode at 30 fps", !screen_match_wanted(d, 1, 120, 30));
+    CHECK("DM_SCREEN_MATCH=vrr switches a 120 Hz variable-refresh screen at 60 fps", screen_match_wanted(v, 1, 120, 60));
+    CHECK("DM_SCREEN_MATCH=vrr switches a variable-refresh screen of unknown rate", screen_match_wanted(v, 1, 0, 60));
+    CHECK("by default a fixed 144 Hz screen switches at 60 fps", screen_match_wanted(d, 0, 144, 60));
+    CHECK("by default a variable-refresh 144 Hz screen switches at 60 fps (not a multiple)", screen_match_wanted(d, 1, 144, 60));
+    CHECK("by default a fixed 120 Hz screen keeps its mode at 60 fps", !screen_match_wanted(d, 0, 120, 60));
+    CHECK("a fixed 120 Hz screen switches at 50 fps", screen_match_wanted(d, 0, 120, 50));
+    CHECK("a 59.94 Hz screen counts as 60", !screen_match_wanted(d, 0, 59.94, 60) && !screen_match_wanted(v, 0, 59.94, 30));
+    CHECK("a screen of unknown rate keeps its mode by default", !screen_match_wanted(d, 0, 0, 60) && !screen_match_wanted(d, 1, 0, 60));
+    CHECK("DM_SCREEN_MATCH=0 keeps every mode", !screen_match_wanted(o, 0, 144, 60) && !screen_match_wanted(o, 1, 120, 60));
+    CHECK("no frame rate yet: no switch", !screen_match_wanted(v, 1, 120, 0) && !screen_match_wanted(d, 0, 144, 0));
 }
 static void metal_lifecycle(void) {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -190,7 +207,7 @@ static void metal_lifecycle(void) {
 int main(int argc, char **argv) { @autoreleasepool {
     alarm(10); setbuf(stdout, NULL);
     if (argc > 2 || (argc == 2 && strcmp(argv[1], "--metal"))) return 2;
-    thresholds(); backoff(); settings(); lifecycle(); latency(); thirty(); vrr120();
+    thresholds(); backoff(); settings(); lifecycle(); latency(); thirty(); vrr120(); screen_match();
     if (argc == 2) metal_lifecycle();
     printf("present rescue: %d checks, %d failed\n", checks, failed); return failed != 0;
 } }
